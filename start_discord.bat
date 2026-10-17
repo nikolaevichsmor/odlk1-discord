@@ -1,5 +1,5 @@
 @echo off
-rem ODLK1 Discord RPC runner (silent background execution with system tray icon)
+rem BOINC Discord RPC runner (silent background execution with system tray icon)
 cd /d "%~dp0"
 where pythonw >nul 2>&1
 if %errorlevel% equ 0 (
