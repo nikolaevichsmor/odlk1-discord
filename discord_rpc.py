@@ -1,8 +1,9 @@
 """
-Zero-dependency Discord Rich Presence (RPC) client for ODLK1.
+Zero-dependency Multi-Project Discord Rich Presence (RPC) client for BOINC.
 Communicates directly with the local Discord client via Windows Named Pipes (\\\\.\\pipe\\discord-ipc-0..9).
-Reads active BOINC task telemetry and completed task counts with zero overhead.
+Supports cyclic status rotation across active BOINC projects.
 """
+import copy
 import ctypes
 import json
 import os
@@ -15,27 +16,113 @@ import time
 import uuid
 
 DEFAULT_CLIENT_ID = "1559236488305311916"
-DEFAULT_LARGE_IMAGE = "https://raw.githubusercontent.com/nikolaevichsmor/odlk1-discord/main/docs/odlk1_matrix_v2.gif"
-DEFAULT_SMALL_IMAGE = "https://raw.githubusercontent.com/nikolaevichsmor/odlk1-discord/main/docs/boinc_badge.gif"
+GITHUB_REPO_URL = "https://github.com/nikolaevichsmor/boinc-discord"
+RAW_DOCS_BASE = "https://raw.githubusercontent.com/nikolaevichsmor/boinc-discord/main/docs"
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "discord_config.json")
+
+# Built-in supported BOINC projects
+PROJECTS = [
+    {
+        "id": "odlk1",
+        "name": "latinsquares",
+        "client_id": "1559236488305311916",
+        "url_match": "latinsquares",
+        "job_log": "job_log_boinc.multi-pool.info_latinsquares.txt",
+        "details": "Searching 10x10 Latin Squares",
+        "large_image": f"{RAW_DOCS_BASE}/odlk1_matrix_v2.gif",
+        "large_text": "latinsquares",
+        "project_url": "https://boinc.multi-pool.info/latinsquares/",
+        "enabled": True
+    },
+    {
+        "id": "milkyway",
+        "name": "MilkyWay@home",
+        "client_id": "1559236488305311916",
+        "url_match": "milkyway",
+        "job_log": "job_log_milkyway.cs.rpi.edu_milkyway.txt",
+        "details": "N-Body Galaxy Simulation",
+        "large_image": f"{RAW_DOCS_BASE}/milkyway_v2.gif",
+        "large_text": "MilkyWay@home",
+        "project_url": "https://milkyway.cs.rpi.edu/milkyway/",
+        "enabled": True
+    },
+    {
+        "id": "wcg",
+        "name": "World Community Grid",
+        "client_id": "1559236488305311916",
+        "url_match": "worldcommunitygrid",
+        "job_log": "job_log_www.worldcommunitygrid.org.txt",
+        "details": "Medical & Humanitarian Research",
+        "large_image": f"{RAW_DOCS_BASE}/wcg_v3.gif",
+        "large_text": "World Community Grid",
+        "project_url": "https://www.worldcommunitygrid.org/",
+        "enabled": True
+    },
+    {
+        "id": "asteroids",
+        "name": "Asteroids@home",
+        "client_id": "1559236488305311916",
+        "url_match": "asteroidsathome",
+        "job_log": "job_log_asteroidsathome.net_boinc.txt",
+        "details": "3D Asteroid Shape Modeling",
+        "large_image": f"{RAW_DOCS_BASE}/asteroids_v2.gif",
+        "large_text": "Asteroids@home",
+        "project_url": "https://asteroidsathome.net/boinc/",
+        "enabled": True
+    },
+    {
+        "id": "einstein",
+        "name": "Einstein@Home",
+        "client_id": "1559236488305311916",
+        "url_match": "einstein",
+        "job_log": "job_log_einstein.phys.uwm.edu.txt",
+        "details": "Pulsar & Gravity Wave Search",
+        "large_image": f"{RAW_DOCS_BASE}/einstein.gif",
+        "large_text": "Einstein@Home",
+        "project_url": "https://einstein.phys.uwm.edu/",
+        "enabled": True
+    },
+    {
+        "id": "primegrid",
+        "name": "PrimeGrid",
+        "client_id": "1559236488305311916",
+        "url_match": "primegrid",
+        "job_log": "job_log_www.primegrid.com.txt",
+        "details": "Record Prime Number Search",
+        "large_image": f"{RAW_DOCS_BASE}/primegrid_v2.gif",
+        "large_text": "PrimeGrid",
+        "project_url": "https://www.primegrid.com/",
+        "enabled": True
+    },
+    {
+        "id": "rosetta",
+        "name": "Rosetta@home",
+        "client_id": "1559236488305311916",
+        "url_match": "bakerlab.org",
+        "job_log": "job_log_boinc.bakerlab.org_rosetta.txt",
+        "details": "3D Protein Folding & Design",
+        "large_image": f"{RAW_DOCS_BASE}/rosetta.gif",
+        "large_text": "Rosetta@home",
+        "project_url": "https://boinc.bakerlab.org/",
+        "enabled": True
+    }
+]
 
 
 def load_config():
     defaults = {
-        "client_id": DEFAULT_CLIENT_ID,
         "update_interval": 4.5,
+        "rotate_interval": 18.0,
         "boinc_data": None,
-        "boinccmd": None,
-        "large_image": DEFAULT_LARGE_IMAGE,
-        "large_text": "ODLK1 Latin Squares",
-        "small_image": DEFAULT_SMALL_IMAGE,
-        "small_text": "BOINC"
+        "boinccmd": None
     }
     if os.path.isfile(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                defaults.update({k: v for k, v in data.items() if v is not None})
+            for k in ("update_interval", "rotate_interval", "boinc_data", "boinccmd"):
+                if data.get(k) is not None:
+                    defaults[k] = data[k]
         except Exception:
             pass
     return defaults
@@ -60,7 +147,7 @@ if sys.platform == "win32":
 
 
 class DiscordIPC:
-    """Low-level Discord IPC client over named pipe with non-blocking reads and auto-reconnect."""
+    """Low-level Discord IPC client over named pipe with non-blocking reads and dynamic client_id switching."""
     OP_HANDSHAKE = 0
     OP_FRAME = 1
     OP_CLOSE = 2
@@ -68,7 +155,7 @@ class DiscordIPC:
     OP_PONG = 4
 
     def __init__(self, client_id=None):
-        self.client_id = client_id or load_config().get("client_id", DEFAULT_CLIENT_ID)
+        self.client_id = str(client_id or DEFAULT_CLIENT_ID)
         self.pipe = None
         self.connected = False
         self._lock = threading.Lock()
@@ -83,13 +170,24 @@ class DiscordIPC:
             while time.time() - start < timeout:
                 res = _k32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
                 if not res:
-                    raise OSError("Pipe broken or disconnected (e.g. Discord account switch)")
+                    raise OSError("Pipe broken or disconnected")
                 if avail.value >= num_bytes:
                     return self.pipe.read(num_bytes)
                 time.sleep(0.02)
             raise TimeoutError("Timeout waiting for response from Discord pipe")
         else:
             return self.pipe.read(num_bytes)
+
+    def switch_client_id(self, new_client_id):
+        """Switches the active Discord Application Client ID, reconnecting cleanly if changed."""
+        new_client_id = str(new_client_id or DEFAULT_CLIENT_ID)
+        if self.client_id == new_client_id and self.connected and self.pipe:
+            return True
+        if self.connected:
+            self.clear_activity()
+            self.disconnect()
+        self.client_id = new_client_id
+        return self.connect()
 
     def connect(self):
         acquired = self._lock.acquire(timeout=0.5)
@@ -157,7 +255,7 @@ class DiscordIPC:
                 self.pipe.write(struct.pack("<II", self.OP_FRAME, len(data)) + data)
                 hdr = self._read_exact(8, timeout=2.0)
                 op, length = struct.unpack("<II", hdr)
-                resp_data = self._read_exact(length, timeout=2.0)
+                self._read_exact(length, timeout=2.0)
                 if op == self.OP_CLOSE:
                     self._disconnect_locked()
                     return False
@@ -215,31 +313,45 @@ class DiscordIPC:
             self._lock.release()
 
 
-class OdlkPresenceService:
+class BoincPresenceService:
     """
-    Background worker that monitors BOINC ODLK progress and syncs to Discord.
-    Respects Discord rate limits (default updates every 4.5 seconds).
+    Background worker that monitors multiple BOINC projects and rotates them cyclically in Discord RPC.
+    Respects Discord rate limits (default updates every 4.5s, rotates active projects every 18s).
     """
 
-    def __init__(self, client_id=None, boinc_data=None, boinccmd=None, update_interval=4.5):
+    def __init__(self, boinc_data=None, boinccmd=None,
+                 update_interval=None, rotate_interval=None,
+                 on_status_change=None):
         cfg = load_config()
-        self.client_id = client_id or cfg.get("client_id", DEFAULT_CLIENT_ID)
-        self.ipc = DiscordIPC(client_id=self.client_id)
+        self.default_client_id = DEFAULT_CLIENT_ID
+        self.projects = copy.deepcopy(PROJECTS)
+
+        self.ipc = DiscordIPC(client_id=self.default_client_id)
         self.running = False
         self.paused = False
         self.thread = None
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+
+        self.update_interval = float(update_interval or cfg.get("update_interval", 4.5))
+        self.rotate_interval = float(rotate_interval or cfg.get("rotate_interval", 18.0))
         self.last_update = 0.0
-        self.update_interval = update_interval or cfg.get("update_interval", 4.5)
-        self.current_task_name = None
-        self.task_start_time = None
+        self.last_rotate_time = 0.0
+
         self.data_dir = boinc_data or cfg.get("boinc_data") or self._find_boinc_data()
         self.boinccmd = boinccmd or cfg.get("boinccmd") or self._find_boinccmd()
-        self.job_log_path = self._find_job_log()
-        self.large_image = cfg.get("large_image", DEFAULT_LARGE_IMAGE)
-        self.large_text = cfg.get("large_text", "ODLK1 Latin Squares")
-        self.small_image = cfg.get("small_image", DEFAULT_SMALL_IMAGE)
-        self.small_text = cfg.get("small_text", "BOINC")
+
+        # Per-project state: sticky task tracking & job_log line count cache
+        self.tracked_tasks = {}  # { proj_id: {"wu_name": str, "start_time": int} }
+        self._job_log_cache = {}  # { proj_id: (mtime, size, count) }
+
+        # Rotation state
+        self.rotation_index = 0
+        self.locked_project_id = None  # None = Auto Rotate across active projects
+        self.active_project_ids = []
+        self.current_displayed_project = None
+        self.current_displayed_pct = 0.0
+        self.on_status_change = on_status_change
 
     def _find_boinc_data(self):
         for candidate in [r"C:\Other\data.BOINC", r"C:\ProgramData\BOINC", r"C:\Other\BOINC"]:
@@ -253,34 +365,44 @@ class OdlkPresenceService:
                 return candidate
         return "boinccmd"
 
-    def _find_job_log(self):
-        if self.data_dir:
-            p = os.path.join(self.data_dir, "job_log_boinc.multi-pool.info_latinsquares.txt")
-            if os.path.isfile(p):
-                return p
-        return None
+    def get_completed_tasks_count(self, project):
+        if not self.data_dir:
+            return 0
+        job_log_name = project.get("job_log")
+        if not job_log_name:
+            return 0
+        path = os.path.join(self.data_dir, job_log_name)
+        if not os.path.isfile(path):
+            return 0
+        pid = project["id"]
+        try:
+            st = os.stat(path)
+            cached = self._job_log_cache.get(pid)
+            if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                return cached[2]
+            with open(path, "rb") as f:
+                count = sum(buf.count(b"\n") for buf in iter(lambda: f.read(1024 * 1024), b""))
+            self._job_log_cache[pid] = (st.st_mtime, st.st_size, count)
+            return count
+        except Exception:
+            return 0
 
-    def get_completed_tasks_count(self):
-        if self.job_log_path and os.path.isfile(self.job_log_path):
-            try:
-                with open(self.job_log_path, "rb") as f:
-                    return sum(buf.count(b"\n") for buf in iter(lambda: f.read(1024 * 1024), b""))
-            except Exception:
-                pass
-        return 0
-
-    def get_active_task_info(self):
-        """Returns (task_name, fraction_done, elapsed) or None."""
+    def _fetch_all_boinc_tasks(self):
         if not self.data_dir or not os.path.isfile(self.boinccmd):
-            return None
+            return []
         flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
         try:
-            out = subprocess.run([self.boinccmd, "--get_tasks"], cwd=self.data_dir,
-                                 capture_output=True, text=True, timeout=5, creationflags=flags).stdout
+            out = subprocess.run(
+                [self.boinccmd, "--get_tasks"],
+                cwd=self.data_dir,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=flags
+            ).stdout
         except Exception:
-            return None
+            return []
 
-        # Parse tasks
         tasks = []
         cur = None
         for line in out.splitlines():
@@ -290,20 +412,33 @@ class OdlkPresenceService:
             elif cur is not None and ":" in line:
                 k, v = line.split(":", 1)
                 cur[k.strip()] = v.strip()
+        return tasks
 
-        # Find active ODLK executing tasks
-        active = [t for t in tasks if "latinsquares" in (t.get("project URL") or "")
-                  and t.get("active_task_state") == "EXECUTING"]
+    def _select_task_for_project(self, project, all_tasks):
+        """
+        Finds active executing tasks for `project` and returns (wu_name, frac, elapsed, start_time) or None.
+        Tracks a chosen workunit continuously to 100% before picking the next freshest task.
+        """
+        pid = project["id"]
+        url_match = (project.get("url_match") or "").lower()
+        active = [
+            t for t in all_tasks
+            if url_match in (t.get("project URL") or "").lower()
+            and t.get("active_task_state") == "EXECUTING"
+        ]
         if not active:
+            self.tracked_tasks.pop(pid, None)
             return None
 
-        # Check if the currently tracked task is still active and executing
+        state = self.tracked_tasks.get(pid)
         tracked = None
-        if self.current_task_name:
-            tracked = next((t for t in active if (t.get("WU name") or t.get("name")) == self.current_task_name), None)
+        if state and state.get("wu_name"):
+            tracked = next(
+                (t for t in active if (t.get("WU name") or t.get("name")) == state["wu_name"]),
+                None
+            )
 
-        # If the currently tracked task completed (or not yet chosen),
-        # pick the task with the LOWEST fraction done (freshest task) to track to completion
+        now = time.time()
         if not tracked:
             min_frac = 2.0
             for t in active:
@@ -315,12 +450,13 @@ class OdlkPresenceService:
                 except ValueError:
                     pass
             if tracked:
-                self.current_task_name = tracked.get("WU name") or tracked.get("name")
+                wu_name = tracked.get("WU name") or tracked.get("name") or project["name"]
                 try:
                     el = float(tracked.get("elapsed task time", 0.0))
                 except ValueError:
                     el = 0.0
-                self.task_start_time = int(time.time() - el) if el > 0 else int(time.time())
+                start_ts = int(now - el) if el > 0 else int(now)
+                self.tracked_tasks[pid] = {"wu_name": wu_name, "start_time": start_ts}
 
         if tracked:
             try:
@@ -331,11 +467,62 @@ class OdlkPresenceService:
                 elapsed = float(tracked.get("elapsed task time", 0.0))
             except ValueError:
                 elapsed = 0.0
-            name = tracked.get("WU name") or tracked.get("name") or "ODLK1"
-            return name, frac, elapsed
+            wu_name = tracked.get("WU name") or tracked.get("name") or project["name"]
+            start_ts = int(now - elapsed) if elapsed > 0 else self.tracked_tasks[pid]["start_time"]
+            self.tracked_tasks[pid]["start_time"] = start_ts
+            return wu_name, frac, elapsed, start_ts
 
-        self.current_task_name = None
         return None
+
+    def get_active_projects_telemetry(self):
+        """
+        Polls BOINC once and returns a list of (project_dict, task_tuple) for all currently executing projects.
+        """
+        all_tasks = self._fetch_all_boinc_tasks()
+        active_list = []
+        for proj in self.projects:
+            if not proj.get("enabled", True):
+                continue
+            t_info = self._select_task_for_project(proj, all_tasks)
+            if t_info is not None:
+                active_list.append((proj, t_info))
+        self.active_project_ids = [p["id"] for p, _ in active_list]
+        return active_list
+
+    def force_next_project(self):
+        """Immediately advances the cyclic rotation to the next active project."""
+        self.locked_project_id = None
+        self.rotation_index += 1
+        self.last_rotate_time = time.time()
+        self.last_update = 0.0
+        self._wake_event.set()
+
+    def set_locked_project(self, project_id):
+        """Locks Discord status to a specific project ID, or None for automatic cyclic rotation."""
+        self.locked_project_id = project_id
+        self.last_rotate_time = time.time()
+        self.last_update = 0.0
+        self._wake_event.set()
+
+    def get_status_summary(self):
+        """Returns a human-readable status string for the system tray tooltip and menu."""
+        if self.paused:
+            return "BOINC Discord RPC (Paused)"
+        if not self.current_displayed_project:
+            return "BOINC Discord RPC (Waiting for tasks)"
+        pname = self.current_displayed_project.get("name", "BOINC")
+        pct = self.current_displayed_pct
+        total_active = len(self.active_project_ids)
+        if total_active > 1 and not self.locked_project_id:
+            return f"BOINC RPC - {pname} ({pct:.1f}%) [{total_active} active]"
+        return f"BOINC RPC - {pname} ({pct:.1f}%)"
+
+    def _notify_status(self):
+        if self.on_status_change:
+            try:
+                self.on_status_change()
+            except Exception:
+                pass
 
     def start(self):
         if self.running:
@@ -348,6 +535,7 @@ class OdlkPresenceService:
     def stop(self):
         self.running = False
         self._stop_event.set()
+        self._wake_event.set()
         if self.ipc:
             self.ipc.clear_activity()
             self.ipc.disconnect()
@@ -359,76 +547,116 @@ class OdlkPresenceService:
                 self.ipc.clear_activity()
         else:
             self.last_update = 0.0
+        self._notify_status()
+        self._wake_event.set()
+
+    def _build_activity(self, project, wu_name, frac, start_time):
+        pct = frac * 100.0
+        total_completed = self.get_completed_tasks_count(project)
+        completed_str = f"{total_completed:,}".replace(",", " ")
+
+        details = project.get("details") or f"Computing {project['name']}"
+        state_str = f"{pct:.1f}% ({completed_str} tasks completed)"
+
+        activity = {
+            "name": project.get("name", "BOINC"),
+            "details": details,
+            "state": state_str,
+            "timestamps": {
+                "start": start_time
+            },
+            "buttons": [
+                {
+                    "label": "What is this?",
+                    "url": "https://boinc.berkeley.edu/"
+                },
+                {
+                    "label": "GitHub",
+                    "url": GITHUB_REPO_URL
+                }
+            ]
+        }
+
+        assets = {}
+        if project.get("large_image"):
+            assets["large_image"] = project["large_image"]
+            assets["large_text"] = project.get("large_text", project.get("name", "BOINC"))
+        if project.get("small_image"):
+            assets["small_image"] = project["small_image"]
+            assets["small_text"] = project.get("small_text", "BOINC")
+        if assets:
+            activity["assets"] = assets
+
+        return activity, pct
 
     def _run_loop(self):
+        self.last_rotate_time = time.time()
         while not self._stop_event.is_set():
             if self.paused:
                 if self.ipc.connected:
                     self.ipc.clear_activity()
-                time.sleep(0.5)
+                self._wake_event.wait(timeout=0.5)
+                self._wake_event.clear()
                 continue
 
             now = time.time()
-            # Respect Discord rate limit: update at most once every interval
             if now - self.last_update < self.update_interval:
-                time.sleep(0.5)
+                self._wake_event.wait(timeout=0.4)
+                self._wake_event.clear()
                 continue
 
-            if not self.ipc.connected:
-                if not self.ipc.connect():
-                    # Retry in 5 seconds if Discord is closed or switching accounts
-                    time.sleep(5.0)
-                    continue
-
-            task_info = self.get_active_task_info()
-            if not task_info:
-                # No active task, clear status
-                self.ipc.clear_activity()
+            active_telemetry = self.get_active_projects_telemetry()
+            if not active_telemetry:
+                self.current_displayed_project = None
+                self.current_displayed_pct = 0.0
+                if self.ipc.connected:
+                    self.ipc.clear_activity()
+                self._notify_status()
                 self.last_update = now
-                time.sleep(2.0)
+                self._wake_event.wait(timeout=2.5)
+                self._wake_event.clear()
                 continue
 
-            wu_name, frac, elapsed = task_info
-            if wu_name != self.current_task_name:
-                self.current_task_name = wu_name
-                self.task_start_time = int(now - elapsed) if elapsed > 0 else int(now)
+            # Choose which project to display in this cycle
+            chosen_pair = None
+            if self.locked_project_id:
+                chosen_pair = next(
+                    ((p, t) for p, t in active_telemetry if p["id"] == self.locked_project_id),
+                    None
+                )
 
-            pct = frac * 100.0
-            total_completed = self.get_completed_tasks_count()
-            completed_str = f"{total_completed:,}".replace(",", " ")
+            if chosen_pair is None:
+                # Automatic cyclic rotation across active projects
+                if len(active_telemetry) > 1 and (now - self.last_rotate_time) >= self.rotate_interval:
+                    self.rotation_index = (self.rotation_index + 1) % len(active_telemetry)
+                    self.last_rotate_time = now
+                else:
+                    self.rotation_index = self.rotation_index % len(active_telemetry)
+                chosen_pair = active_telemetry[self.rotation_index]
 
-            activity = {
-                "details": "Searching 10x10 Latin Squares",
-                "state": f"{pct:.1f}% ({completed_str} tasks completed)",
-                "timestamps": {
-                    "start": self.task_start_time or int(now)
-                },
-                "buttons": [
-                    {
-                        "label": "What is this?",
-                        "url": "https://boinc.multi-pool.info/latinsquares/"
-                    },
-                    {
-                        "label": "GitHub",
-                        "url": "https://github.com/nikolaevichsmor/odlk1-discord"
-                    }
-                ]
-            }
+            project, (wu_name, frac, elapsed, start_time) = chosen_pair
+            target_client_id = project.get("client_id") or self.default_client_id
 
-            assets = {}
-            if self.large_image:
-                assets["large_image"] = self.large_image
-                assets["large_text"] = self.large_text
-            if self.small_image:
-                assets["small_image"] = self.small_image
-                assets["small_text"] = self.small_text
-            if assets:
-                activity["assets"] = assets
+            # Ensure IPC is connected with the target project's Discord Client ID
+            if not self.ipc.switch_client_id(target_client_id):
+                self._wake_event.wait(timeout=4.0)
+                self._wake_event.clear()
+                continue
 
+            activity, pct = self._build_activity(project, wu_name, frac, start_time)
             success = self.ipc.send_activity(activity)
             self.last_update = time.time()
-            if not success:
-                # Pipe broken or disconnected (e.g. account switch), retry sooner
-                time.sleep(2.0)
+
+            if success:
+                self.current_displayed_project = project
+                self.current_displayed_pct = pct
+                self._notify_status()
+                self._wake_event.wait(timeout=self.update_interval)
+                self._wake_event.clear()
             else:
-                time.sleep(self.update_interval)
+                self._wake_event.wait(timeout=2.0)
+                self._wake_event.clear()
+
+
+# Backwards-compatibility alias
+OdlkPresenceService = BoincPresenceService
